@@ -1,12 +1,17 @@
 #define F_CPU 8000000
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <util/delay.h>
+#include <avr/pgmspace.h>
+#include <string.h>
+#include "x68k-keyboard-to-pc8801.h"
 
 #define X68k_INPUT_PIN	0
 #define X68k_READY_PIN	1
 #define PC88_OUTPUT_PIN	2
 
+#define PC88_SUPPORTED_KEYBOARD_ROWS	15
+
+// State machine state list
 #define STATE_RECIEVER_STANDBY 0
 #define STATE_RECIEVER_ACTIVE 1
 #define STATE_RECIEVER_DONE 2
@@ -28,6 +33,8 @@ volatile unsigned char transmitter_shifted_bits = 0;
 volatile unsigned char transmitter_parity_bit_set;
 volatile unsigned short int transmitter_buffer = 0x0000;
 
+unsigned char key_matrix[PC88_SUPPORTED_KEYBOARD_ROWS];
+
 void enable_input_change_interrupt() {
 	GIFR = (1 << PCIF);
 	GIMSK |= (1 << PCIE);
@@ -45,7 +52,6 @@ void enable_input_timer_interrupt() {
 	TCNT0 = (255 - RECIEVER_COUNTER_HALF_TOP);
 	TIFR = (1 << OCF0A);
 	TIMSK |= (1 << OCIE0A);
-	OCR0A = RECIEVER_COUNTER_TOP;
 	GTCCR &= ~(1 << TSM);
 }
 
@@ -120,7 +126,6 @@ ISR(PCINT0_vect) {
 
 ISR(TIMER0_COMPA_vect) {
 	unsigned char current_bit = PINB << 7;
-	OCR0A = RECIEVER_COUNTER_TOP;
 
 	if (reciever_bits_recieved++ == 8) {
 		// Check whether we have a stop bit
@@ -178,6 +183,8 @@ ISR(TIMER1_COMPA_vect) {
 }
 
 void main() {
+	unsigned char packed_keycode, current_row, current_col;
+
 	// Disable ADC, as we don't need it
 	PRR = (1 << PRADC) | (1 << PRUSI);
 
@@ -198,6 +205,9 @@ void main() {
 
 	// Set up initial values for the reciever & sender machines
 	device_state = STATE_RECIEVER_STANDBY;
+
+	// Set up initial values for the pressed keys map
+	memset(key_matrix, 0xFF, PC88_SUPPORTED_KEYBOARD_ROWS);
 
 	/*
 	 * Configure Timer 0 for reciever operation
@@ -226,7 +236,6 @@ void main() {
 	OCR1A = TRANSMITTER_COUNTER_TOP;
 	OCR1C = TRANSMITTER_COUNTER_TOP;
 
-	_delay_ms(500);
 	set_keyboard_ready();
 
 	sei();
@@ -237,29 +246,30 @@ void main() {
 			case STATE_RECIEVER_DONE:
 				// Perform translation, switch to transmitter
 				clear_keyboard_ready();
-				transmitter_shifted_bits = -1;
 
-				if (reciever_buffer == 0x1D) {
-					transmitter_buffer = 0b011111110001;
-					enable_transmitter_timer_interrupt();
-					device_state = STATE_TRANSMITTER_ACTIVE;
-				} else if (reciever_buffer == 0x9D) {
-					transmitter_buffer = 0b111111110001;
-					enable_transmitter_timer_interrupt();
-					device_state = STATE_TRANSMITTER_ACTIVE;
-				} else if (reciever_buffer == 0x47) {
-					transmitter_buffer = 0b111011110000;
-					enable_transmitter_timer_interrupt();
-					device_state = STATE_TRANSMITTER_ACTIVE;
-				} else if (reciever_buffer == 0xC7) {
-					transmitter_buffer = 0b111111110000;
-					enable_transmitter_timer_interrupt();
-					device_state = STATE_TRANSMITTER_ACTIVE;
-				} else {
-					device_state = STATE_RECIEVER_STANDBY;
+				packed_keycode = pgm_read_byte(&keymap[reciever_buffer & 0x7F]);
+
+				if (packed_keycode == UNMAPPED_KEY) {
+					// The key is unmapped, we just ignore it.
 					enable_input_change_interrupt();
+					device_state = STATE_RECIEVER_STANDBY;
 					set_keyboard_ready();
+				} else {
+					current_row = packed_keycode & 0x0F;
+					current_col = packed_keycode >> 4;
+
+					if (reciever_buffer & 0x80) {
+						// This is a "break" code, the key was released
+						key_matrix[current_row] |= (1 << current_col);
+					} else {
+						// This is a "make" code, the key was pressed
+						key_matrix[current_row] &= ~(1 << current_col);
+					}
+
+					send_keycode_to_pc88(
+						((unsigned short int)key_matrix[current_row] << 4) | current_row);
 				}
+
 				break;
 
 			case STATE_TRANSMITTER_DONE:

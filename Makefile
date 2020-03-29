@@ -2,7 +2,7 @@ CC=avr-gcc
 RM=rm
 TARGET_MCU=attiny25
 FIRMWARE_FILE=x68k-kbd-to-pc8801.elf
-OBJECT_FILES=src/main.o
+OBJECT_FILES=src/main.o src/keymap.o
 
 all: $(FIRMWARE_FILE)
 
