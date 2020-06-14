@@ -107,6 +107,24 @@ void send_keycode_to_pc88(unsigned short int keycode) {
 }
 
 /*
+ * Reset the adapter key matrix to its default state, and
+ * also reset the PC88 keys registers.
+ */
+void reset_keys_matrix() {
+	unsigned char current_row;
+
+	// Set up initial values for the pressed keys map
+	memset(key_matrix, 0xFF, PC88_SUPPORTED_KEYBOARD_ROWS);
+
+	for (current_row = 0; current_row < PC88_SUPPORTED_KEYBOARD_ROWS; current_row++) {
+		send_keycode_to_pc88((unsigned short int)(0xFF << 4) | current_row);
+
+		// Busy wait until the current keycode is sent.
+		while(device_state != STATE_TRANSMITTER_DONE) { }
+	}
+}
+
+/*
  * Pin Change interrupt handler
  * When triggered, the start bit of the keyboard UART output
  * has been recieved by the microcontroller.
@@ -203,12 +221,6 @@ void main() {
 	// Clear the Ready signal
 	clear_keyboard_ready();
 
-	// Set up initial values for the reciever & sender machines
-	device_state = STATE_RECIEVER_STANDBY;
-
-	// Set up initial values for the pressed keys map
-	memset(key_matrix, 0xFF, PC88_SUPPORTED_KEYBOARD_ROWS);
-
 	/*
 	 * Configure Timer 0 for reciever operation
 	 */
@@ -236,9 +248,16 @@ void main() {
 	OCR1A = TRANSMITTER_COUNTER_TOP;
 	OCR1C = TRANSMITTER_COUNTER_TOP;
 
+	sei();
+
+	// Clean the PC88 and local key matrix.
+	reset_keys_matrix();
+
+	// Set up initial values for the reciever & sender machines
+	device_state = STATE_RECIEVER_STANDBY;
+
 	set_keyboard_ready();
 
-	sei();
 	enable_input_change_interrupt();
 
 	while(1) {
@@ -251,9 +270,11 @@ void main() {
 
 				if (packed_keycode == UNMAPPED_KEY) {
 					// The key is unmapped, we just ignore it.
-					enable_input_change_interrupt();
-					device_state = STATE_RECIEVER_STANDBY;
-					set_keyboard_ready();
+					device_state = STATE_TRANSMITTER_DONE;
+				} else if (packed_keycode == PANIC_KEY && reciever_buffer & 0x80) {
+					// The Panic key (which is the 登録 key) has been released.
+					// Declare all the rows as clean.
+					reset_keys_matrix();
 				} else {
 					current_row = packed_keycode & 0x0F;
 					current_col = packed_keycode >> 4;

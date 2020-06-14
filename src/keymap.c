@@ -96,7 +96,7 @@ const unsigned char keymap[] PROGMEM = {
 	PC8801_KEY(0x01, 0x05), // KP ,
 	PC8801_KEY(0x01, 0x06), // KP .
 	UNMAPPED_KEY,
-	UNMAPPED_KEY,
+	PANIC_KEY,
 	PC8801_KEY(0x0A, 0x03), // HELP
 	PC8801_KEY(0x08, 0x04), // XF1 key, mapped as Graph key
 	UNMAPPED_KEY,
