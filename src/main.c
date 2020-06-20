@@ -1,31 +1,19 @@
-#define F_CPU 8000000
+#define F_CPU 8000000L
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include <avr/pgmspace.h>
 #include <string.h>
 #include "x68k-keyboard-to-pc8801.h"
 
-#define X68k_INPUT_PIN	0
-#define X68k_READY_PIN	1
-#define PC88_OUTPUT_PIN	2
-
-#define PC88_SUPPORTED_KEYBOARD_ROWS	15
-
-// State machine state list
-#define STATE_RECIEVER_STANDBY 0
-#define STATE_RECIEVER_ACTIVE 1
-#define STATE_RECIEVER_DONE 2
-#define STATE_TRANSMITTER_ACTIVE 3
-#define STATE_TRANSMITTER_DONE 4
-
 #define RECIEVER_PRESCALER 64
-#define RECIEVER_COUNTER_TOP 51 // (F_CPU / (2400 * RECIEVER_PRESCALER)) + 1
+#define RECIEVER_COUNTER_TOP (F_CPU / (2400L * RECIEVER_PRESCALER)) - 1
 #define RECIEVER_COUNTER_HALF_TOP RECIEVER_COUNTER_TOP / 2
 
 #define TRANSMITTER_PRESCALER 8
-#define TRANSMITTER_COUNTER_TOP 47 // (F_CPU / (20800 * TRANSMITTER_PRESCALER)) - 1
+#define TRANSMITTER_COUNTER_TOP (F_CPU / (20800L * TRANSMITTER_PRESCALER)) - 1
 
-volatile unsigned char device_state;
+volatile unsigned char transmitter_state, reciever_state;
+
 volatile unsigned char reciever_buffer;
 volatile unsigned char reciever_bits_recieved;
 
@@ -101,7 +89,7 @@ void send_keycode_to_pc88(unsigned short int keycode) {
 
 	// We are ready to send the keycode to the computer.
 	// Set the PC-8801 output pin to the Space level, and enable the timer.
-	device_state = STATE_TRANSMITTER_ACTIVE;
+	transmitter_state = STATE_ACTIVE;
 	enable_transmitter_timer_interrupt();
 	PORTB &= ~(1 << PC88_OUTPUT_PIN);
 }
@@ -120,7 +108,7 @@ void reset_keys_matrix() {
 		send_keycode_to_pc88((unsigned short int)(0xFF << 4) | current_row);
 
 		// Busy wait until the current keycode is sent.
-		while(device_state != STATE_TRANSMITTER_DONE) { }
+		while(transmitter_state != STATE_STANDBY) { }
 	}
 }
 
@@ -134,7 +122,7 @@ ISR(PCINT0_vect) {
 		disable_input_change_interrupt();
 		
 		// Prepare the reciever variables
-		device_state = STATE_RECIEVER_ACTIVE;
+		reciever_state = STATE_ACTIVE;
 		reciever_buffer = 0xFF;
 		reciever_bits_recieved = 0;
 
@@ -147,17 +135,15 @@ ISR(TIMER0_COMPA_vect) {
 
 	if (reciever_bits_recieved++ == 8) {
 		// Check whether we have a stop bit
-		if (current_bit) {
+		if (current_bit && !fifo_is_full()) {
 			// We have a supposedly valid byte recieved byte, we can safely
-			// disable Timer 0 and push the recieved byte to its buffer
-			device_state = STATE_RECIEVER_DONE;
-		} else {
-			// We have a logic 1 on the input, this is not a stop bit.
-			// We just discard the frame in this case.
-			enable_input_change_interrupt();
-			device_state = STATE_RECIEVER_STANDBY;
+			// disable Timer 0 and push the recieved byte to its buffer.
+			// We also checked that the FIFO was not full.
+			fifo_write(reciever_buffer);
 		}
 
+		reciever_state = STATE_STANDBY;
+		enable_input_change_interrupt();
 		disable_input_timer_interrupt();
 	} else {
 		/*
@@ -185,7 +171,7 @@ ISR(TIMER1_COMPA_vect) {
 			// Stop bit case.
 			PORTB |= (1 << PC88_OUTPUT_PIN);
 			disable_transmitter_timer_interrupt();
-			device_state = STATE_TRANSMITTER_DONE;
+			transmitter_state = STATE_STANDBY;
 			break;
 
 		default:
@@ -201,9 +187,9 @@ ISR(TIMER1_COMPA_vect) {
 }
 
 void main() {
-	unsigned char packed_keycode, current_row, current_col;
+	unsigned char input_keycode, packed_keycode, current_row, current_col, fifo_full_cleared;
 
-	// Disable ADC, as we don't need it
+	// Disable the ADC and the USI, as we don't need it
 	PRR = (1 << PRADC) | (1 << PRUSI);
 
 	/*
@@ -253,51 +239,56 @@ void main() {
 	// Clean the PC88 and local key matrix.
 	reset_keys_matrix();
 
+	// Reset the X68k keyboard input FIFO buffer
+	fifo_reset();
+
 	// Set up initial values for the reciever & sender machines
-	device_state = STATE_RECIEVER_STANDBY;
+	transmitter_state = STATE_STANDBY;
+	reciever_state = STATE_STANDBY;
 
 	set_keyboard_ready();
 
 	enable_input_change_interrupt();
 
+	fifo_full_cleared = 1;
+
 	while(1) {
-		switch (device_state) {
-			case STATE_RECIEVER_DONE:
-				// Perform translation, switch to transmitter
-				clear_keyboard_ready();
+		if ((!fifo_is_empty()) && transmitter_state == STATE_STANDBY) {
+			input_keycode = fifo_read();
+			packed_keycode = pgm_read_byte(&keymap[input_keycode & 0x7F]);
 
-				packed_keycode = pgm_read_byte(&keymap[reciever_buffer & 0x7F]);
+			if (packed_keycode == PANIC_KEY && input_keycode & 0x80) {
+				// The Panic key (which is the 登録 key) has been released.
+				// Declare all the rows as clean.
+				fifo_reset();
+				reset_keys_matrix();
+			} else {
+				current_row = packed_keycode & 0x0F;
+				current_col = packed_keycode >> 4;
 
-				if (packed_keycode == UNMAPPED_KEY) {
-					// The key is unmapped, we just ignore it.
-					device_state = STATE_TRANSMITTER_DONE;
-				} else if (packed_keycode == PANIC_KEY && reciever_buffer & 0x80) {
-					// The Panic key (which is the 登録 key) has been released.
-					// Declare all the rows as clean.
-					reset_keys_matrix();
+				if (input_keycode & 0x80) {
+					// This is a "break" code, the key was released
+					key_matrix[current_row] |= (1 << current_col);
 				} else {
-					current_row = packed_keycode & 0x0F;
-					current_col = packed_keycode >> 4;
-
-					if (reciever_buffer & 0x80) {
-						// This is a "break" code, the key was released
-						key_matrix[current_row] |= (1 << current_col);
-					} else {
-						// This is a "make" code, the key was pressed
-						key_matrix[current_row] &= ~(1 << current_col);
-					}
-
-					send_keycode_to_pc88(
-						((unsigned short int)key_matrix[current_row] << 4) | current_row);
+					// This is a "make" code, the key was pressed
+					key_matrix[current_row] &= ~(1 << current_col);
 				}
 
-				break;
+				send_keycode_to_pc88(
+					((unsigned short int)key_matrix[current_row] << 4) | current_row);
+			}
+		}
 
-			case STATE_TRANSMITTER_DONE:
-				device_state = STATE_RECIEVER_STANDBY;
-				enable_input_change_interrupt();
-				set_keyboard_ready();
-				break;
+		if (fifo_is_full()) {
+			clear_keyboard_ready();
+			disable_input_change_interrupt();
+			fifo_full_cleared = 0;
+		} else if (!fifo_full_cleared) {
+			// Track that we recovered from a full FIFO condition to avoid messing with
+			// the interrupt registers on each loop cycle
+			enable_input_change_interrupt();
+			set_keyboard_ready();
+			fifo_full_cleared = 1;
 		}
 	}
 }
